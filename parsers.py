@@ -179,9 +179,15 @@ def parse_employee_catalog(filepath: str) -> pd.DataFrame:
     # pandas read_excel로 한번에 읽기 (cell-by-cell 대비 10배+ 빠름)
     df = pd.read_excel(filepath, sheet_name='Empleados', engine='openpyxl')
     
-    # 활성 직원만 필터링 (ACTIVO 상태)
-    if 'Estatus empleado' in df.columns:
-        df = df[df['Estatus empleado'].str.upper().str.contains('ACTIV', na=False)].copy()
+    # 최근 데이터(2025년 이후 퇴사 등) 포함하거나 조건없이 전체 반환 (메모리 문제 없으므로)
+    if 'Fecha de baja' in df.columns:
+        df['Fecha_de_baja_dt'] = pd.to_datetime(df['Fecha de baja'], errors='coerce')
+        if 'Estatus empleado' in df.columns:
+            df = df[
+                df['Estatus empleado'].str.upper().str.contains('ACTIV', na=False) |
+                (df['Fecha_de_baja_dt'] >= '2025-01-01')
+            ].copy()
+        df = df.drop(columns=['Fecha_de_baja_dt'], errors='ignore')
     
     # 핵심 컬럼 한국어 rename
     rename_map = {
@@ -196,6 +202,7 @@ def parse_employee_catalog(filepath: str) -> pd.DataFrame:
         'Turno de trabajo': '근무교대',
         'Sindicalizado': '노조가입',
         'Fecha de alta': '입사일',
+        'Fecha de baja': '퇴사일',
         'Sexo': '성별',
         'Estatus empleado': '재직상태',
     }
@@ -268,6 +275,7 @@ def _extract_period_info(ws) -> Dict:
         'date_from': '',
         'date_to': '',
         'reg_pat': '',
+        'fte_value': 0.0,
     }
     
     for r in range(1, 10):
@@ -280,22 +288,25 @@ def _extract_period_info(ws) -> Dict:
             if 'DONGJIN' in val_str.upper():
                 info['company'] = val_str
             
-            if 'Periodo' in val_str:
+            if 'PERIODO' in val_str.upper():
                 # 급여 주기 타입 추출
-                if 'Semanal' in val_str:
+                if 'SEMANAL' in val_str.upper():
                     info['period_type'] = '주급'
-                elif 'Quincenal' in val_str:
+                    info['fte_value'] = 0.25
+                elif 'QUINCENAL' in val_str.upper():
                     info['period_type'] = '격주급'
-                elif 'MENSUAL' in val_str or 'Mensual' in val_str:
+                    info['fte_value'] = 0.5
+                elif 'MENSUAL' in val_str.upper():
                     info['period_type'] = '월급'
+                    info['fte_value'] = 1.0
                 
                 # 기간 번호 추출
-                period_match = re.search(r'Periodo\s+(\d+)', val_str)
+                period_match = re.search(r'Periodo\s+(\d+)', val_str, re.IGNORECASE)
                 if period_match:
                     info['period_number'] = period_match.group(1)
                 
                 # 날짜 추출
-                date_match = re.search(r'del\s+(\S+)\s+al\s+(\S+)', val_str)
+                date_match = re.search(r'del\s+(\S+)\s+al\s+(\S+)', val_str, re.IGNORECASE)
                 if date_match:
                     info['date_from'] = date_match.group(1)
                     info['date_to'] = date_match.group(2)
@@ -382,7 +393,8 @@ def parse_payroll_file(filepath: str) -> Tuple[pd.DataFrame, Dict]:
             continue
         
         # 직원 데이터 행 추출
-        row_data = {'부서(원문)': current_dept, 'Reg_Pat': current_reg_pat}
+        fte_val = period_info.get('fte_value', 0.0)
+        row_data = {'부서(원문)': current_dept, 'Reg_Pat': current_reg_pat, 'FTE_기여도': fte_val}
         for c in range(1, ws.max_column + 1):
             col_name = headers[c-1]
             cell_val = ws.cell(row=r, column=c).value
@@ -468,6 +480,7 @@ def load_all_payroll_files(data_dir: str) -> Dict[str, List[Tuple[pd.DataFrame, 
             if df.empty:
                 continue
             
+            info['filename'] = fname
             period_type = info.get('period_type', '')
             if period_type in result:
                 result[period_type].append((df, info))
@@ -493,6 +506,34 @@ def merge_weekly_to_monthly(payroll_data: Dict) -> pd.DataFrame:
             df_copy = df.copy()
             df_copy['급여유형'] = period_type
             df_copy['기간번호'] = info.get('period_number', '')
+            
+            # 1. 파일명에서 YYYY_MM 추출 시도
+            fname = info.get('filename', '')
+            ym_match = re.search(r'(\d{4})_(\d{2})', fname)
+            
+            # 2. 파일명 추출 실패 시 엑셀 내부에 적힌 급여 종료일(date_to) 추출 (DD/MM/YYYY)
+            date_to = str(info.get('date_to', '')).strip()
+            date_to_clean = re.sub(r'[.-]', '/', date_to) # 통일된 구분자
+            
+            if ym_match:
+                df_copy['YearMonth'] = f"{ym_match.group(1)}-{ym_match.group(2)}"
+            elif date_to_clean and '/' in date_to_clean:
+                parts = date_to_clean.split('/')
+                if len(parts) >= 3:
+                    year_match = re.search(r'(20\d\d)', parts[2])
+                    year = year_match.group(1) if year_match else '2026'
+                    month = ''.join(filter(str.isdigit, parts[1]))
+                    month = month.zfill(2) if month else '01'
+                    df_copy['YearMonth'] = f"{year}-{month}"
+                else:
+                    df_copy['YearMonth'] = '2026-01' # 강제 회복 fallback
+            else:
+                # 3. 최후의 수단: 파일명에 'Mensual 1 2026' 같은 텍스트가 있다면...
+                # 못찾으면 그냥 2026-01으로 할당 (전개 편의성)
+                y_match = re.search(r'(20\d\d)', fname)
+                year = y_match.group(1) if y_match else '2026'
+                df_copy['YearMonth'] = f"{year}-01"
+                
             all_frames.append(df_copy)
     
     if not all_frames:
@@ -511,9 +552,20 @@ def merge_weekly_to_monthly(payroll_data: Dict) -> pd.DataFrame:
     for col in numeric_cols:
         combined[col] = pd.to_numeric(combined[col], errors='coerce').fillna(0)
     
+    # NaN 결측치 처리 및 문자열 명시적 변환
+    if 'YearMonth' not in combined.columns:
+        combined['YearMonth'] = '2026-01'
+    
+    combined['YearMonth'] = combined['YearMonth'].fillna('2026-01').astype(str).str.strip()
+    combined.loc[combined['YearMonth'].str.lower().isin(['unknown', 'nan', 'nat', '']), 'YearMonth'] = '2026-01'
+    
+    # pd.to_datetime()을 통해 유효하지 않은 포맷을 걸러내고 통일
+    temp_dates = pd.to_datetime(combined['YearMonth'], errors='coerce')
+    combined['YearMonth'] = temp_dates.dt.strftime('%Y-%m').fillna('2026-01')
+        
     # 직원별 월간 합산
-    # 그룹핑 키: 사원번호 + 부서
-    group_keys = ['사원번호', '직원명', '부서(원문)', '부서']
+    # 그룹핑 키: 사원번호 + 부서 + YearMonth
+    group_keys = ['사원번호', '직원명', '부서(원문)', '부서', 'YearMonth']
     group_keys = [k for k in group_keys if k in combined.columns]
     
     # 합산할 숫자 컬럼
@@ -550,6 +602,49 @@ def calculate_summary_stats(monthly_df: pd.DataFrame, employee_df: pd.DataFrame 
     
     stats['total_headcount'] = len(monthly_df)
     
+    # 정확한 입/퇴사일 기반 FTE 계산
+    if employee_df is not None and not employee_df.empty and '사원번호' in employee_df.columns:
+        emp_meta = employee_df[['사원번호', '입사일', '퇴사일']].copy() if '퇴사일' in employee_df.columns else employee_df[['사원번호', '입사일']].copy()
+        if '퇴사일' not in emp_meta.columns:
+            emp_meta['퇴사일'] = None
+        if '입사일' not in emp_meta.columns:
+            emp_meta['입사일'] = None
+            
+        emp_meta['사원번호'] = emp_meta['사원번호'].astype(str).str.strip()
+        
+        monthly_tmp = monthly_df.copy()
+        monthly_tmp['사원번호'] = monthly_tmp['사원번호'].astype(str).str.strip()
+        merged = monthly_tmp.merge(emp_meta, on='사원번호', how='left')
+        
+        # 1) 입사일/퇴사일을 파싱 (오류 시 NaT)
+        start_dt = pd.to_datetime(merged['입사일'], errors='coerce')
+        end_dt = pd.to_datetime(merged['퇴사일'], errors='coerce')
+        
+        # 2) 해당 월(YearMonth)의 시작일과 말일 계산
+        ym_series = merged['YearMonth'].astype(str).replace('Unknown', '2026-01')
+        m_start = pd.to_datetime(ym_series + '-01', errors='coerce').fillna(pd.to_datetime('2026-01-01'))
+        m_end = m_start + pd.offsets.MonthEnd(0)
+        
+        # 3) 입사일/퇴사일 결측치 채우기 (해당 월의 처음/끝으로 간주)
+        start_dt = start_dt.fillna(m_start)
+        end_dt = end_dt.fillna(m_end)
+        
+        # 4) 벡터 연산으로 근무 시작일/종료일 클리핑 (max/min)
+        actual_start = start_dt.clip(lower=m_start)
+        actual_end = end_dt.clip(upper=m_end)
+        
+        # 5) 근무 일수 계산 및 음수 값은 0으로 처리
+        month_days = m_end.dt.day
+        worked_days = (actual_end - actual_start).dt.days + 1
+        worked_days = worked_days.clip(lower=0)
+        
+        monthly_df['FTE'] = worked_days / month_days
+    else:
+        # fallback
+        monthly_df['FTE'] = monthly_df['FTE_기여도'] if 'FTE_기여도' in monthly_df.columns else 1.0
+
+    stats['total_fte'] = monthly_df['FTE'].sum()
+    
     # 총 지급액
     if '총지급액' in monthly_df.columns:
         stats['total_earnings'] = monthly_df['총지급액'].sum()
@@ -578,14 +673,16 @@ def calculate_summary_stats(monthly_df: pd.DataFrame, employee_df: pd.DataFrame 
     stats['total_labor_cost'] = stats['total_earnings'] + stats['total_obligations']
     
     # 인당 평균 비용
-    if stats['total_headcount'] > 0:
-        stats['avg_cost_per_person'] = stats['total_labor_cost'] / stats['total_headcount']
+    if stats.get('total_fte', 0) > 0:
+        stats['avg_cost_per_person'] = stats['total_labor_cost'] / stats['total_fte']
     else:
         stats['avg_cost_per_person'] = 0
     
     # 부서별 요약
     if '부서' in monthly_df.columns:
         dept_agg = {'사원번호': 'count'}
+        if 'FTE' in monthly_df.columns:
+            dept_agg['FTE'] = 'sum'
         if '총지급액' in monthly_df.columns:
             dept_agg['총지급액'] = 'sum'
         if '총공제액' in monthly_df.columns:
@@ -596,15 +693,17 @@ def calculate_summary_stats(monthly_df: pd.DataFrame, employee_df: pd.DataFrame 
             dept_agg['총회사부담금'] = 'sum'
         
         dept_summary = monthly_df.groupby('부서').agg(dept_agg).reset_index()
-        dept_summary = dept_summary.rename(columns={'사원번호': '인원수'})
+        dept_summary = dept_summary.rename(columns={'사원번호': '현원'})
         
         if '총지급액' in dept_summary.columns and '총회사부담금' in dept_summary.columns:
             dept_summary['총인건비'] = dept_summary['총지급액'] + dept_summary['총회사부담금']
         elif '총지급액' in dept_summary.columns:
             dept_summary['총인건비'] = dept_summary['총지급액']
         
-        if '총인건비' in dept_summary.columns and '인원수' in dept_summary.columns:
-            dept_summary['인당평균'] = dept_summary['총인건비'] / dept_summary['인원수']
+        if '총인건비' in dept_summary.columns and 'FTE' in dept_summary.columns:
+            dept_summary['인당평균'] = dept_summary['총인건비'] / dept_summary['FTE']
+        elif '총인건비' in dept_summary.columns and '현원' in dept_summary.columns:
+            dept_summary['인당평균'] = dept_summary['총인건비'] / dept_summary['현원']
         
         dept_summary = dept_summary.sort_values('총인건비', ascending=False) if '총인건비' in dept_summary.columns else dept_summary
         stats['dept_summary'] = dept_summary

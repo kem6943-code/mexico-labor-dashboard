@@ -151,7 +151,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-@st.cache_data
+# @st.cache_data
 def load_data_fresh(data_dir: str):
     # Cache busted securely for v4 float NaN defense logic
     results = {}
